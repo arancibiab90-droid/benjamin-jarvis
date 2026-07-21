@@ -1,10 +1,8 @@
-
 import os
 import logging
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# Configuración de logs
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -28,3 +26,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

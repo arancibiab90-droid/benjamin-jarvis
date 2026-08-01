@@ -1,103 +1,94 @@
-
-
-
-
+#!/usr/bin/env python3
 import os
+import json
 import logging
+from pathlib import Path
+
+import httpx
+from flask import Flask
+from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import google.generativeai as genai
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-# ====================== CONFIGURACIÓN ======================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-ALLOWED_CHAT_IDS = {int(x.strip()) for x in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if x.strip()}
+load_dotenv()
 
-# Gemini
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-1.5-flash")
-else:
-    model = None
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+PORT = int(os.getenv("PORT", "10000"))
+
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("benjamin")
 
-# Estado simple de confirmaciones pendientes
-pending_actions = {}
+app_flask = Flask(__name__)
 
-SYSTEM_PROMPT = """Eres Benjamin Jarvis, el agente principal de Izan.
-Eres directo, claro y ejecutivo.
-Nunca hagas cambios importantes sin que el usuario confirme.
-Si propones algo, espera su "sí" o "confirma".
-Responde siempre en español.
-"""
+async def call_gemini(messages: list) -> str:
+    if not GEMINI_API_KEY:
+        return "⚠️ Falta la variable GEMINI_API_KEY en Render."
+    
+    contents = []
+    for m in messages:
+        role = "user" if m["role"] == "user" else "model"
+        contents.append({"role": role, "parts": [{"text": m["content"]}]})
 
-def is_authorized(chat_id: int) -> bool:
-    return chat_id in ALLOWED_CHAT_IDS
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(url, json={"contents": contents})
+        data = r.json()
+        if r.status_code != 200:
+            return f"Error Gemini: {data}"
+        try:
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception:
+            return f"Error leyendo respuesta: {data}"
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_chat.id):
-        await update.message.reply_text("⛔ Acceso denegado.")
-        return
-    await update.message.reply_text(
-        "🤖 Benjamin Jarvis online.\n\n"
-        "Solo tú puedes darme órdenes.\n"
-        "Toda acción importante requiere tu confirmación.\n\n"
-        "Escribe lo que necesites."
-    )
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🧠 *Benjamin Jarvis* activo.\n¿En qué te ayudo hoy con Vórtice IVFA?", parse_mode="Markdown")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    text = (update.message.text or "").strip()
-
-    if not is_authorized(chat_id):
-        await update.message.reply_text("⛔ Acceso denegado.")
+    if not update.message or not update.message.text:
         return
-
-    if not text:
-        return
-
-    # ¿Hay acción pendiente de confirmación?
-    if chat_id in pending_actions:
-        if text.lower() in ["sí", "si", "confirma", "ok", "hazlo", "adelante"]:
-            accion = pending_actions.pop(chat_id)
-            await update.message.reply_text(f"✅ Confirmado. Ejecutando: {accion}")
-            # Aquí más adelante pondremos la ejecución real de código
-            return
-        elif text.lower() in ["no", "cancelar", "cancela"]:
-            pending_actions.pop(chat_id, None)
-            await update.message.reply_text("❌ Acción cancelada.")
-            return
-        else:
-            await update.message.reply_text("⏳ Tienes una acción pendiente. Responde **sí** o **no**.")
-            return
-
-    # Respuesta normal con Gemini
-    if not model:
-        await update.message.reply_text("⚠️ Falta configurar GEMINI_API_KEY en Render.")
-        return
-
-    try:
-        prompt = f"{SYSTEM_PROMPT}\n\nUsuario: {text}"
-        response = model.generate_content(prompt)
-        respuesta = response.text.strip()
-        await update.message.reply_text(respuesta)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+    text = update.message.text.strip()
+    await update.message.chat.send_action("typing")
+    
+    prompt_sistema = "Eres Benjamin Jarvis, cerebro autónomo del Holding Arancibia (Vórtice IVFA, Paine, Chile). Asistes a Izan Benjamín Arancibia Martínez."
+    historial = [
+        {"role": "user", "content": f"{prompt_sistema}\n\nEl usuario dice: {text}"}
+    ]
+    
+    reply = await call_gemini(historial)
+    await update.message.reply_text(reply)
 
 def main():
     if not TELEGRAM_TOKEN:
-        raise RuntimeError("Falta TELEGRAM_BOT_TOKEN")
-    if not ALLOWED_CHAT_IDS:
-        raise RuntimeError("Falta ALLOWED_CHAT_IDS")
+        logger.error("Falta TELEGRAM_TOKEN")
+        raise SystemExit(1)
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & \~filters.COMMAND, handle_message))
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Benjamin Jarvis iniciando... Solo responde a: %s", ALLOWED_CHAT_IDS)
-    app.run_polling()
+    if WEBHOOK_URL:
+        url = WEBHOOK_URL.rstrip("/") + "/webhook"
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path="webhook",
+            webhook_url=url,
+            drop_pending_updates=True,
+        )
+    else:
+        application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()

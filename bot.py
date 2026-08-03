@@ -48,7 +48,7 @@ def run_flask():
 async def call_multi_ai(user_message: str) -> str:
   full_prompt = f"{SYSTEM_PROMPT}\n\nUsuario: {user_message}"
 
-  # 1. Intento con modelos gratuitos de Gemini
+  # 1. Intento con modelos de Gemini (Versión v1beta)
   if GEMINI_API_KEY:
     gemini_models = [
         "gemini-2.0-flash",
@@ -66,46 +66,50 @@ async def call_multi_ai(user_message: str) -> str:
           r = await client.post(url, json=payload)
           if r.status_code == 200:
             return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-          elif r.status_code == 429:
+          else:
             logger.warning(
-                f"Cuota Gemini agotada en {model}. Conmutando al siguiente..."
+                f"Gemini {model} devolvió código {r.status_code}: {r.text}"
             )
-            continue
         except Exception as e:
           logger.error(f"Error Gemini {model}: {e}")
 
-  # 2. Respaldos con Grok (xAI)
+  # 2. Resguardo con Grok (Modelos xAI actualizados: grok-2-mini / grok-2)
   if GROK_API_KEY:
     headers = {
-        "Authorization": f"Bearer {GROK_API_KEY}",
+        "Authorization": f"Bearer {GROK_API_KEY.strip()}",
         "Content-Type": "application/json",
     }
-    payload_grok = {
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        "model": "grok-beta",
-        "temperature": 0.7,
-    }
+    grok_models = ["grok-2-mini", "grok-2"]
     async with httpx.AsyncClient(timeout=30) as client:
-      try:
-        r = await client.post(
-            "https://api.x.ai/v1/chat/completions",
-            headers=headers,
-            json=payload_grok,
-        )
-        if r.status_code == 200:
-          return r.json()["choices"][0]["message"]["content"]
-        else:
-          logger.warning(f"Grok respondió con código {r.status_code}")
-      except Exception as e:
-        logger.error(f"Error en Grok: {e}")
+      for g_model in grok_models:
+        payload_grok = {
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            "model": g_model,
+            "temperature": 0.7,
+        }
+        try:
+          r = await client.post(
+              "https://api.x.ai/v1/chat/completions",
+              headers=headers,
+              json=payload_grok,
+          )
+          if r.status_code == 200:
+            return r.json()["choices"][0]["message"]["content"]
+          else:
+            logger.warning(
+                f"Grok ({g_model}) respondió con código {r.status_code}:"
+                f" {r.text}"
+            )
+        except Exception as e:
+          logger.error(f"Error en Grok ({g_model}): {e}")
 
   # 3. Resguardo con DeepSeek
   if DEEPSEEK_API_KEY:
     headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY.strip()}",
         "Content-Type": "application/json",
     }
     payload_ds = {

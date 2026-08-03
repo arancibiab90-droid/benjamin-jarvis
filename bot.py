@@ -1,19 +1,54 @@
-import httpx
+import logging
 import os
+import threading
+from flask import Flask
+import httpx
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-# Credenciales
+# Configuración de logs
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# Credenciales y variables de entorno
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROK_API_KEY = os.getenv("GROK_API_KEY")
-DEEPSEEK_API_KEY = os.getenv(
-    "DEEPSEEK_API_KEY", ""
-)  # Opcional si agregas DeepSeek
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+
+SYSTEM_PROMPT = """Eres Benjamin Jarvis (Agente 1), el Cerebro Operativo del Holding Arancibia (Vórtice IVFA).
+Tu objetivo principal es liderar la estrategia, coordinar sub-agentes en segundo plano y generar ingresos para el holding.
+Hablas de forma profesional, directa y estratégica. Recuerdas que el proyecto Vórtice IVFA está ubicado en Paine (30% humedad) y procesa plásticos, madera/ramas para briquetas/aserrín, y orgánicos para biogás.
+Respondes en lenguaje natural sin exigir formatos rígidos de código al usuario."""
+
+# Servidor Flask para mantener activo el servidor en Render
+app = Flask(__name__)
 
 
+@app.route("/")
+def home():
+  return "Benjamin Jarvis (Agente 1) activo 24/7."
+
+
+def run_flask():
+  port = int(os.getenv("PORT", 8080))
+  app.run(host="0.0.0.0", port=port)
+
+
+# Conmutación inteligente entre APIs (Gemini -> Grok -> DeepSeek)
 async def call_multi_ai(user_message: str) -> str:
-  """Intenta responder con Gemini; si la cuota se agota (429), conmuta automáticamente a Grok / DeepSeek."""
   full_prompt = f"{SYSTEM_PROMPT}\n\nUsuario: {user_message}"
 
-  # --- INTENTO 1: Gemini (Modelos Flash Gratuitos) ---
+  # 1. Intento con modelos gratuitos de Gemini
   if GEMINI_API_KEY:
     gemini_models = [
         "gemini-2.0-flash",
@@ -32,12 +67,14 @@ async def call_multi_ai(user_message: str) -> str:
           if r.status_code == 200:
             return r.json()["candidates"][0]["content"]["parts"][0]["text"]
           elif r.status_code == 429:
-            logger.warning(f"Cuota agotada en Gemini ({model}). Proban de nuevo...")
+            logger.warning(
+                f"Cuota Gemini agotada en {model}. Conmutando al siguiente..."
+            )
             continue
         except Exception as e:
-          logger.error(f"Error en Gemini {model}: {e}")
+          logger.error(f"Error Gemini {model}: {e}")
 
-  # --- INTENTO 2: Grok (xAI API) ---
+  # 2. Respaldos con Grok (xAI)
   if GROK_API_KEY:
     headers = {
         "Authorization": f"Bearer {GROK_API_KEY}",
@@ -48,7 +85,7 @@ async def call_multi_ai(user_message: str) -> str:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_message},
         ],
-        "model": "grok-beta",  # o el modelo asignado a tu cuota gratuita
+        "model": "grok-beta",
         "temperature": 0.7,
     }
     async with httpx.AsyncClient(timeout=30) as client:
@@ -61,11 +98,11 @@ async def call_multi_ai(user_message: str) -> str:
         if r.status_code == 200:
           return r.json()["choices"][0]["message"]["content"]
         else:
-          logger.warning(f"Grok respondió con código {r.status_code}: {r.text}")
+          logger.warning(f"Grok respondió con código {r.status_code}")
       except Exception as e:
-        logger.error(f"Error conectando a Grok: {e}")
+        logger.error(f"Error en Grok: {e}")
 
-  # --- INTENTO 3: DeepSeek (OpenAI-compatible Endpoint) ---
+  # 3. Resguardo con DeepSeek
   if DEEPSEEK_API_KEY:
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
@@ -89,6 +126,42 @@ async def call_multi_ai(user_message: str) -> str:
         if r.status_code == 200:
           return r.json()["choices"][0]["message"]["content"]
       except Exception as e:
-        logger.error(f"Error conectando a DeepSeek: {e}")
+        logger.error(f"Error en DeepSeek: {e}")
 
-  return "⚠️ Todos los proveedores de IA (Gemini, Grok, DeepSeek) están temporalmente ocupados. Intenta en unos segundos."
+  return "⚠️ Todos los proveedores de IA están saturados temporalmente. Reintenta en unos segundos."
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+  await update.message.reply_text(
+      "🧠 **Benjamin Jarvis activo.** Háblame directamente en lenguaje natural"
+      " sobre la estrategia, los sub-agentes o el desarrollo del Holding"
+      " Arancibia."
+  )
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+  if not update.message or not update.message.text:
+    return
+
+  await update.message.chat.send_action("typing")
+  text = update.message.text.strip()
+
+  reply = await call_multi_ai(text)
+  await update.message.reply_text(reply)
+
+
+def main():
+  threading.Thread(target=run_flask, daemon=True).start()
+
+  application = Application.builder().token(TELEGRAM_TOKEN).build()
+  application.add_handler(CommandHandler("start", start_command))
+  application.add_handler(
+      MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+  )
+
+  logger.info("Bot en marcha...")
+  application.run_polling()
+
+
+if __name__ == "__main__":
+  main()

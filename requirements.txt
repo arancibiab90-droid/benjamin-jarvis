@@ -1,6 +1,5 @@
-python-telegram-bot[webhooks]
+python-telegram-bot
 httpx
-python-dotenv
-
+flask
 
 

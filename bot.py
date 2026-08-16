@@ -5,7 +5,6 @@ from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import httpx
-import replicate
 
 # Configuración de logs
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -21,7 +20,7 @@ def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
-# Prompt Maestro con los Agentes Integrados
+# Prompt Maestro
 SYSTEM_PROMPT = """
 Eres Jarvis, el asistente ejecutivo de IA a tiempo completo de Izan Benjamín Arancibia Martinez.
 Lideras el holding Arancibia Global Group y el proyecto Vórtice IVFA en Paine (planta de reciclaje, pirolisis, biogás y productos revalorizados).
@@ -68,7 +67,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 *Jarvis Operativo - Arancibia Global Group*\n\n"
         "Comandos disponibles:\n"
         "• `/finanzas` - UF, Dólar y UTM en tiempo real (Chile).\n"
-        "• `/generar_imagen [descripción]` - Crear renders 3D e imágenes HD con Replicate.\n"
+        "• `/generar_imagen [descripción]` - Crear imágenes HD con Hugging Face ($0 costo).\n"
         "• `/script_video [tema]` - Crear guiones publicitarios para TikTok/Reels.\n"
         "• O escríbeme directamente cualquier instrucción."
     )
@@ -99,23 +98,28 @@ async def finanzas_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error al consultar finanzas: {str(e)}")
 
 async def generar_imagen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prompt_usuario = " ".join(context.args) if context.args else "Render 3D fotorealista de planta industrial de reciclaje y pirolisis Vórtice en Paine"
-    token = os.environ.get("REPLICATE_API_TOKEN")
+    prompt_usuario = " ".join(context.args) if context.args else "Planta industrial de reciclaje y pirolisis Vortice en Paine"
+    hf_token = os.environ.get("HUGGINGFACE_TOKEN")
     
-    if not token:
-        await update.message.reply_text("⚠️ Falta REPLICATE_API_TOKEN en Render.")
+    if not hf_token:
+        await update.message.reply_text("⚠️ Falta HUGGINGFACE_TOKEN en Render.")
         return
 
-    await update.message.reply_text(f"🎨 *Generando imagen con FLUX...*\n_Prompt: {prompt_usuario}_", parse_mode="Markdown")
+    await update.message.reply_text(f"🎨 *Generando imagen gratuita con Hugging Face...*\n_Prompt: {prompt_usuario}_", parse_mode="Markdown")
+    
+    API_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
+    headers = {"Authorization": f"Bearer {hf_token}"}
+    
     try:
-        output = replicate.run(
-            "black-forest-labs/flux-schnell",
-            input={"prompt": prompt_usuario, "aspect_ratio": "1:1", "output_format": "webp"}
-        )
-        if output:
-            await update.message.reply_photo(photo=output[0], caption=f"🖼️ Imagen: {prompt_usuario}")
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(API_URL, headers=headers, json={"inputs": prompt_usuario})
+            if response.status_code == 200:
+                image_bytes = response.content
+                await update.message.reply_photo(photo=image_bytes, caption=f"🖼️ Imagen: {prompt_usuario}")
+            else:
+                await update.message.reply_text(f"❌ Error Hugging Face ({response.status_code}): {response.text}")
     except Exception as e:
-        await update.message.reply_text(f"❌ Error Replicate: {str(e)}")
+        await update.message.reply_text(f"❌ Error al generar imagen: {str(e)}")
 
 async def script_video_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tema = " ".join(context.args) if context.args else "Cajas de Mercadería Vórtice Pantry"
@@ -130,7 +134,7 @@ async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     respuesta = await consultar_gemini(texto_usuario)
     await update.message.reply_text(respuesta)
 
-# Inicialización y ejecución
+# Inicialización
 def main():
     threading.Thread(target=run_flask, daemon=True).start()
     

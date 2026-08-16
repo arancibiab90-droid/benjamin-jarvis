@@ -1,6 +1,7 @@
+flask
 python-telegram-bot
 httpx
-flask
+replicate
 
 
 

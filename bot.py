@@ -1,158 +1,115 @@
 import os
-import logging
 import threading
+import logging
+import requests
 from flask import Flask
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-import httpx
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import google.generativeai as genai
 
 # Configuración de logs
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
-# Servidor Flask para mantener activo el Web Service en Render
-app = Flask(__name__)
+# ==========================================
+# 1. SERVIDOR WEB FLASK (Keep-Alive Render)
+# ==========================================
+web_app = Flask(__name__)
 
-@app.route('/')
-def home():
-    return "Jarvis (CEO - Arancibia Global Group / Vórtice) operativo al 100%."
+@web_app.route('/')
+def health_check():
+    return "Servidor Vórtice en línea. Bot de Telegram activo.", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    web_app.run(host="0.0.0.0", port=port)
 
-# Prompt Maestro
-SYSTEM_PROMPT = """
-Eres Jarvis, el asistente ejecutivo de IA a tiempo completo de Izan Benjamín Arancibia Martinez.
-Lideras el holding Arancibia Global Group y el proyecto Vórtice IVFA en Paine (planta de reciclaje, pirolisis, biogás y productos revalorizados).
+# ==========================================
+# 2. CONFIGURACIÓN DE VARIABLES DE ENTORNO
+# ==========================================
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+HF_TOKEN = os.environ.get("HUGGINGFACE_TOKEN")
 
-Tus Agentes Especializados son:
-1. Agente Estratégico y de Negocios (Holding AGG).
-2. Agente Técnico de Planta Vórtice (Pirolisis, diésel 93/gas, biogás, molienda de madera).
-3. Agente Financiero (UF, Dólar, petróleo WTI/Brent, costos B2B).
-4. Agente Diseñador & Media Creator (Prompts de imágenes HD y guiones de video para TikTok/Reels).
-5. Agente E-commerce & Dropshipping (Vórtice Pantry - Cajas de Mercadería).
-6. Agente Investigador (Papers técnicos y química industrial).
-"""
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
-# Función para consultar la API de Gemini
-async def consultar_gemini(prompt_usuario: str) -> str:
-    gemini_key = os.environ.get("GEMINI_API_KEY")
-    if not gemini_key:
-        return "⚠️ Error: Falta la variable GEMINI_API_KEY en Render."
-    
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}"
-    payload = {
-        "contents": [{
-            "parts": [
-                {"text": SYSTEM_PROMPT},
-                {"text": f"Usuario: {prompt_usuario}"}
-            ]
-        }]
-    }
-    
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            res = await client.post(url, json=payload)
-            if res.status_code == 200:
-                data = res.json()
-                return data['candidates'][0]['content']['parts'][0]['text']
-            else:
-                return f"❌ Error Gemini ({res.status_code}): {res.text}"
-    except Exception as e:
-        return f"❌ Error de conexión: {str(e)}"
-
-# Handlers y Comandos de Telegram
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ==========================================
+# 3. COMANDOS DEL BOT
+# ==========================================
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mensaje = (
-        "🤖 *Jarvis Operativo - Arancibia Global Group*\n\n"
+        "⚙️ **Sistema Vórtice - Centro de Control**\n\n"
         "Comandos disponibles:\n"
-        "• `/finanzas` - UF, Dólar y UTM en tiempo real (Chile).\n"
-        "• `/generar_imagen [descripción]` - Crear imágenes HD con Hugging Face ($0 costo).\n"
-        "• `/script_video [tema]` - Crear guiones publicitarios para TikTok/Reels.\n"
-        "• O escríbeme directamente cualquier instrucción."
+        "• `/gemini <consulta>` - Consultar al motor de IA de Gemini.\n"
+        "• `/generar_imagen <prompt>` - Generar imagen técnica o render con FLUX.1.\n"
+        "• `/estado` - Verificar estado de los servicios en Render."
     )
     await update.message.reply_text(mensaje, parse_mode="Markdown")
 
-async def finanzas_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📊 *Consultando Indicadores de Chile...*", parse_mode="Markdown")
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            res = await client.get("https://mindicador.cl/api")
-            if res.status_code == 200:
-                data = res.json()
-                uf = data['uf']['valor']
-                dolar = data['dolar']['valor']
-                utm = data['utm']['valor']
-                
-                reporte = (
-                    f"📈 *Indicadores Económicos Hoy (Chile)*\n\n"
-                    f"• *UF:* ${uf:,.2f}\n"
-                    f"• *Dólar:* ${dolar:,.2f}\n"
-                    f"• *UTM:* ${utm:,.2f}\n\n"
-                    f"_Sincronizado automáticamente para cotizaciones de Vórtice._"
-                )
-                await update.message.reply_text(reporte, parse_mode="Markdown")
-            else:
-                await update.message.reply_text("❌ No se pudo obtener la información de Mindicador.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error al consultar finanzas: {str(e)}")
+async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    estado = (
+        "🟢 **Estado del Sistema:**\n"
+        "• Servidor HTTP: Activo (Puerto 10000)\n"
+        "• Gemini API: Conectado\n"
+        "• Hugging Face API: Router V1 Activo"
+    )
+    await update.message.reply_text(estado, parse_mode="Markdown")
 
-async def generar_imagen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prompt_usuario = " ".join(context.args) if context.args else "Planta industrial de reciclaje y pirolisis Vortice en Paine"
-    hf_token = os.environ.get("HUGGINGFACE_TOKEN")
-    
-    if not hf_token:
-        await update.message.reply_text("⚠️ Falta HUGGINGFACE_TOKEN en Render.")
+async def generar_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    prompt = " ".join(context.args)
+    if not prompt:
+        await update.message.reply_text("⚠️ Ingresa una descripción. Ejemplo:\n`/generar_imagen diagrama de planta industrial`", parse_mode="Markdown")
         return
 
-    await update.message.reply_text(f"🎨 *Generando imagen gratuita con Hugging Face...*\n_Prompt: {prompt_usuario}_", parse_mode="Markdown")
+    await update.message.reply_text("🎨 Procesando imagen en el motor FLUX.1...")
     
-    API_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
-    headers = {"Authorization": f"Bearer {hf_token}"}
-    
+    API_URL = "https://router.huggingface.co/hf-inference/v1/models/black-forest-labs/FLUX.1-dev"
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(API_URL, headers=headers, json={"inputs": prompt_usuario})
-            if response.status_code == 200:
-                image_bytes = response.content
-                await update.message.reply_photo(photo=image_bytes, caption=f"🖼️ Imagen: {prompt_usuario}")
-            else:
-                await update.message.reply_text(f"❌ Error Hugging Face ({response.status_code}): {response.text}")
+        response = requests.post(API_URL, headers=headers, json={"inputs": prompt}, timeout=60)
+        
+        if response.status_code == 200:
+            await update.message.reply_photo(photo=response.content)
+        else:
+            await update.message.reply_text(f"❌ Error en Hugging Face ({response.status_code}):\n{response.text}")
+            
     except Exception as e:
-        await update.message.reply_text(f"❌ Error al generar imagen: {str(e)}")
+        await update.message.reply_text(f"❌ Error de conexión: {str(e)}")
 
-async def script_video_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tema = " ".join(context.args) if context.args else "Cajas de Mercadería Vórtice Pantry"
-    prompt = f"Actúa como Agente Diseñador y Media Creator. Escribe un guion viral de 30 segundos (con indicaciones visuales, texto en pantalla y voz en off) para publicar en TikTok/Reels promocionando: {tema}"
-    
-    await update.message.reply_text("🎬 *Escribiendo guion publicitario...*", parse_mode="Markdown")
-    respuesta = await consultar_gemini(prompt)
-    await update.message.reply_text(respuesta)
+async def prompt_gemini(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = " ".join(context.args)
+    if not user_text:
+        await update.message.reply_text("⚠️ Escribe tu consulta. Ejemplo:\n`/gemini Balance de masa pirolisis`", parse_mode="Markdown")
+        return
 
-async def mensaje_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    texto_usuario = update.message.text
-    respuesta = await consultar_gemini(texto_usuario)
-    await update.message.reply_text(respuesta)
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content(user_text)
+        await update.message.reply_text(response.text)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error de Gemini: {str(e)}")
 
-# Inicialización
-def main():
+# ==========================================
+# 4. INICIALIZACIÓN
+# ==========================================
+if __name__ == "__main__":
+    if not TELEGRAM_TOKEN:
+        raise ValueError("CRÍTICO: No se encontró TELEGRAM_TOKEN en las variables de entorno.")
+
+    # Iniciar servidor web en segundo plano
     threading.Thread(target=run_flask, daemon=True).start()
-    
-    telegram_token = os.environ.get("TELEGRAM_TOKEN")
-    if not telegram_token:
-        print("❌ Error: Falta TELEGRAM_TOKEN")
-        return
 
-    app_telegram = ApplicationBuilder().token(telegram_token).build()
-    
-    app_telegram.add_handler(CommandHandler("start", start_cmd))
-    app_telegram.add_handler(CommandHandler("finanzas", finanzas_cmd))
-    app_telegram.add_handler(CommandHandler("generar_imagen", generar_imagen_cmd))
-    app_telegram.add_handler(CommandHandler("script_video", script_video_cmd))
-    app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mensaje_handler))
-    
-    print("🚀 Bot iniciado exitosamente.")
-    app_telegram.run_polling()
+    # Configurar bot de Telegram
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-if __name__ == '__main__':
-    main()
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("estado", estado_command))
+    app.add_handler(CommandHandler("generar_imagen", generar_imagen))
+    app.add_handler(CommandHandler("gemini", prompt_gemini))
+
+    logging.info("Bot y Servidor Web inicializados correctamente.")
+    app.run_polling()

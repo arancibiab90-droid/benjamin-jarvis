@@ -1,5 +1,7 @@
 import os
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
@@ -13,6 +15,29 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 logger = logging.getLogger("BenjaminJarvis")
+
+# ─────────────────────────────────────────────
+# SERVIDOR HTTP MÍNIMO — solo para que Render detecte un puerto abierto
+# ─────────────────────────────────────────────
+# Render (plan free) exige que el servicio escuche en un puerto HTTP,
+# aunque el bot funcione por polling a Telegram. Este servidor no hace
+# nada más que responder "OK" para que el health check de Render pase.
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Benjamin Jarvis operativo")
+
+    def log_message(self, format, *args):
+        pass  # silenciar el log de cada ping de Render
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logger.info("Health check server escuchando en puerto %s", port)
+    server.serve_forever()
 
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN DE APIs — Cascada: NVIDIA → Grok → Claude → Gemini
@@ -347,6 +372,9 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("voz", cmd_voz))
     app.add_handler(CommandHandler("imagen", cmd_imagen))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+
+    # Arranca el servidor HTTP mínimo en un hilo aparte, en paralelo al polling de Telegram
+    threading.Thread(target=start_health_server, daemon=True).start()
 
     logger.info("Bot Benjamin Jarvis en ejecución...")
     app.run_polling()

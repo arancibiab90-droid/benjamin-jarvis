@@ -1,4 +1,6 @@
 import os
+import time
+import asyncio
 import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -101,6 +103,7 @@ SYSTEM_PROMPT = (
 # (leer historial al iniciar, guardar tras cada intercambio).
 conversation_history: dict[int, list[dict]] = {}
 last_ai_response: dict[int, str] = {}
+voice_mode: dict[int, bool] = {}  # True = responde con texto + nota de voz automática
 MAX_HISTORY_MESSAGES = 20  # últimos N mensajes por usuario
 
 
@@ -256,8 +259,12 @@ def generate_voice(text: str) -> bytes | None:
 
 
 # ─────────────────────────────────────────────
-# IMÁGENES (Replicate) — texto a imagen
+# IMÁGENES (Replicate) — texto a imagen (con polling explícito)
 # ─────────────────────────────────────────────
+REPLICATE_POLL_INTERVAL = 2       # segundos entre cada consulta de estado
+REPLICATE_MAX_WAIT_SECONDS = 90    # tiempo máximo total antes de rendirse
+
+
 def generate_image(prompt: str) -> str | None:
     if not REPLICATE_API_KEY:
         logger.warning("REPLICATE_API_KEY no configurada, no se puede generar imagen.")
@@ -266,18 +273,42 @@ def generate_image(prompt: str) -> str | None:
         headers = {
             "Authorization": f"Bearer {REPLICATE_API_KEY}",
             "Content-Type": "application/json",
-            "Prefer": "wait",  # espera la predicción sin tener que hacer polling manual
         }
         payload = {"input": {"prompt": prompt}}
-        resp = requests.post(REPLICATE_URL, headers=headers, json=payload, timeout=60)
+
+        # 1) Crear la predicción (no esperamos, solo la disparamos)
+        resp = requests.post(REPLICATE_URL, headers=headers, json=payload, timeout=20)
         resp.raise_for_status()
-        data = resp.json()
-        output = data.get("output")
+        prediction = resp.json()
+        prediction_url = prediction.get("urls", {}).get("get")
+        status = prediction.get("status")
+
+        if not prediction_url:
+            logger.warning("Replicate no devolvió URL de seguimiento: %s", prediction)
+            return None
+
+        # 2) Consultar el estado en intervalos hasta que termine o se acabe el tiempo
+        elapsed = 0
+        while status not in ("succeeded", "failed", "canceled") and elapsed < REPLICATE_MAX_WAIT_SECONDS:
+            time.sleep(REPLICATE_POLL_INTERVAL)
+            elapsed += REPLICATE_POLL_INTERVAL
+            poll_resp = requests.get(prediction_url, headers=headers, timeout=20)
+            poll_resp.raise_for_status()
+            prediction = poll_resp.json()
+            status = prediction.get("status")
+            logger.info("Replicate estado: %s (%ss transcurridos)", status, elapsed)
+
+        if status != "succeeded":
+            logger.warning("Replicate no terminó a tiempo o falló. Estado final: %s", status)
+            return None
+
+        output = prediction.get("output")
         if isinstance(output, list) and output:
             return output[0]
         if isinstance(output, str):
             return output
         return None
+
     except Exception as e:
         logger.warning("Fallo generando imagen con Replicate: %s", str(e))
         return None
@@ -289,7 +320,11 @@ def generate_image(prompt: str) -> str | None:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Benjamin Jarvis operativo. Escríbeme cualquier consulta sobre AGG y te respondo.\n"
-        "Comandos: /voz (te leo la última respuesta) · /imagen <descripción> (genero una imagen)"
+        "Comandos:\n"
+        "/voz — te leo la última respuesta\n"
+        "/vozon — activo audio automático en cada respuesta\n"
+        "/vozoff — vuelvo a solo texto\n"
+        "/imagen <descripción> — genero una imagen"
     )
 
 
@@ -300,7 +335,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     sent_message = await update.message.reply_text("🔄 Procesando solicitud...")
 
-    ai_response = generate_ai_response(chat_id, user_text)
+    ai_response = await asyncio.to_thread(generate_ai_response, chat_id, user_text)
 
     # Guardar en historial solo si la respuesta fue exitosa (no un mensaje de error)
     if not ai_response.startswith("⚠️"):
@@ -314,6 +349,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text=ai_response,
     )
 
+    # Si el usuario activó el modo voz, además del texto le mando la nota de audio
+    if voice_mode.get(chat_id) and not ai_response.startswith("⚠️"):
+        await context.bot.send_chat_action(chat_id=chat_id, action="record_voice")
+        audio_bytes = await asyncio.to_thread(generate_voice, ai_response)
+        if audio_bytes:
+            await context.bot.send_voice(chat_id=chat_id, voice=audio_bytes)
+        else:
+            logger.warning("Modo voz activo pero ElevenLabs no generó audio (revisar key o cuota).")
+
+
+async def cmd_vozon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    voice_mode[chat_id] = True
+    await update.message.reply_text(
+        "🔊 Modo voz activado. Desde ahora respondo con texto + audio en cada mensaje.\n"
+        "Usa /vozoff para volver a solo texto."
+    )
+
+
+async def cmd_vozoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    voice_mode[chat_id] = False
+    await update.message.reply_text("🔇 Modo voz desactivado. Vuelvo a responder solo con texto.")
+
 
 async def cmd_voz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -323,7 +382,7 @@ async def cmd_voz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await context.bot.send_chat_action(chat_id=chat_id, action="record_voice")
-    audio_bytes = generate_voice(text)
+    audio_bytes = await asyncio.to_thread(generate_voice, text)
     if not audio_bytes:
         await update.message.reply_text(
             "⚠️ No pude generar el audio. Revisa que ELEVENLABS_API_KEY esté bien configurada en Render."
@@ -340,14 +399,17 @@ async def cmd_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
-    sent_message = await update.message.reply_text("🎨 Generando imagen...")
-    image_url = generate_image(prompt)
+    sent_message = await update.message.reply_text("🎨 Generando imagen... (puede tardar hasta 90 seg)")
+    image_url = await asyncio.to_thread(generate_image, prompt)
 
     if not image_url:
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=sent_message.message_id,
-            text="⚠️ No pude generar la imagen. Revisa que REPLICATE_API_KEY esté bien configurada en Render.",
+            text=(
+                "⚠️ No pude generar la imagen a tiempo. Puede ser REPLICATE_API_KEY mal configurada, "
+                "cuota agotada, o el modelo tardó más de 90 seg. Intenta de nuevo."
+            ),
         )
         return
 
@@ -370,6 +432,8 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("voz", cmd_voz))
+    app.add_handler(CommandHandler("vozon", cmd_vozon))
+    app.add_handler(CommandHandler("vozoff", cmd_vozoff))
     app.add_handler(CommandHandler("imagen", cmd_imagen))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 

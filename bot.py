@@ -1,6 +1,7 @@
 import os
 import logging
 import threading
+import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update
 from telegram.ext import (
@@ -15,74 +16,71 @@ from anthropic import Anthropic
 import google.generativeai as genai
 
 # ─────────────────────────────────────────────
-# 1. CONFIGURACIÓN DE LOGS Y SISTEMA
+# 1. LOGS
 # ─────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("BenjaminJarvis")
 
 # ─────────────────────────────────────────────
-# 2. SERVIDOR DE SALUD (HEALTHCHECK PARA RENDER WEB SERVICE)
+# 2. SERVIDOR DE SALUD PARA RENDER (PORT 10000)
 # ─────────────────────────────────────────────
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    """Responde 200 OK a los pings de Render para evitar cierres por puerto no detectado."""
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write("Benjamin Jarvis OK - AGG Systems".encode("utf-8"))
+        self.wfile.write("Benjamin Jarvis Active".encode("utf-8"))
 
     def log_message(self, format, *args):
-        # Desactiva logs repetitivos del healthcheck
         return
 
 def start_health_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    logger.info(f"Servidor de salud iniciado en el puerto {port}")
+    logger.info(f"Servidor de salud corriendo en puerto {port}")
     server.serve_forever()
 
 # ─────────────────────────────────────────────
-# 3. LECTURA FLEXIBLE DE VARIABLES DE ENTORNO
+# 3. LECTURA DE VARIABLES DE ENTORNO
 # ─────────────────────────────────────────────
-def get_env_variable(keywords: list[str]) -> str | None:
-    """Busca en las variables de entorno de Render coincidencia con las palabras clave."""
-    for key, value in os.environ.items():
+def get_env_var(keywords: list[str]) -> str | None:
+    for key, val in os.environ.items():
         for kw in keywords:
-            if kw.upper() in key.upper() and value and value.strip():
-                return value.strip()
+            if kw.upper() in key.upper() and val and val.strip():
+                return val.strip()
     return None
 
-TELEGRAM_TOKEN    = get_env_variable(["TELEGRAM", "TELEG", "BOT_TOKEN"])
-NVIDIA_API_KEY   = get_env_variable(["NVIDIA"])
-GROK_API_KEY      = get_env_variable(["GROK", "XAI"])
-ANTHROPIC_API_KEY = get_env_variable(["ANTHROPIC", "CLAUDE"])
-GEMINI_API_KEY    = get_env_variable(["GEMINI", "GOOGLE"])
+TELEGRAM_TOKEN    = get_env_var(["TELEGRAM", "TELEG", "BOT_TOKEN"])
+NVIDIA_API_KEY   = get_env_var(["NVIDIA"])
+GROK_API_KEY      = get_env_var(["GROK", "XAI"])
+ANTHROPIC_API_KEY = get_env_var(["ANTHROPIC", "CLAUDE"])
+GEMINI_API_KEY    = get_env_var(["GEMINI", "GOOGLE"])
 
 # ─────────────────────────────────────────────
-# 4. INICIALIZACIÓN DE CLIENTES DE IA
+# 4. LIMPIADOR AUTOMÁTICO DE WEBHOOKS
 # ─────────────────────────────────────────────
-nvidia_client = OpenAI(
-    base_url="https://integrate.api.nvidia.com/v1",
-    api_key=NVIDIA_API_KEY
-) if NVIDIA_API_KEY else None
+def auto_clean_webhook(token: str):
+    """Borra webhooks atascados directamente en la API de Telegram al iniciar."""
+    try:
+        url = f"https://api.telegram.org/bot{token}/deleteWebhook?drop_pending_updates=true"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req) as response:
+            res = response.read().decode("utf-8")
+            logger.info(f"Limpieza de Telegram completada: {res}")
+    except Exception as e:
+        logger.warning(f"No se pudo limpiar webhook automáticamente: {e}")
 
-grok_client = OpenAI(
-    base_url="https://api.x.ai/v1",
-    api_key=GROK_API_KEY
-) if GROK_API_KEY else None
-
+# ─────────────────────────────────────────────
+# 5. CLIENTES DE IA
+# ─────────────────────────────────────────────
+nvidia_client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=NVIDIA_API_KEY) if NVIDIA_API_KEY else None
+grok_client = OpenAI(base_url="https://api.x.ai/v1", api_key=GROK_API_KEY) if GROK_API_KEY else None
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
 if GEMINI_API_KEY:
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-    except Exception as e:
-        logger.error(f"Error configurando Gemini: {e}")
+    try: genai.configure(api_key=GEMINI_API_KEY)
+    except Exception: pass
 
-# Configuración de modelos exactos
 NVIDIA_MODEL = "meta/llama-3.1-70b-instruct"
 GROK_MODEL   = "grok-beta"
 CLAUDE_MODEL = "claude-3-5-sonnet-20241022"
@@ -91,15 +89,10 @@ GEMINI_MODELS_TO_TRY = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flas
 SYSTEM_PROMPT = (
     "Eres Benjamin Jarvis, el orquestador principal de IA de AGG Global Group Arancibia. "
     "Respondes de forma clara, ejecutiva, precisa y directa. "
-    "Ayudas a Izan Arancibia (CEO de AGG) con la gestión estratégica de Vórtice IVFA, Abasto Express "
-    "y la supervisión de operaciones."
+    "Ayudas a Izan Arancibia (CEO de AGG) con la gestión estratégica de Vórtice IVFA y Abasto Express."
 )
 
-# ─────────────────────────────────────────────
-# 5. GESTIÓN DE MEMORIA EN RAM
-# ─────────────────────────────────────────────
 conversation_history: dict[int, list[dict]] = {}
-MAX_HISTORY_MESSAGES = 20
 
 def get_history(chat_id: int) -> list[dict]:
     return conversation_history.setdefault(chat_id, [])
@@ -107,144 +100,87 @@ def get_history(chat_id: int) -> list[dict]:
 def append_history(chat_id: int, role: str, content: str):
     history = get_history(chat_id)
     history.append({"role": role, "content": content})
-    if len(history) > MAX_HISTORY_MESSAGES:
-        conversation_history[chat_id] = history[-MAX_HISTORY_MESSAGES:]
-
-# ─────────────────────────────────────────────
-# 6. MOTORES DE GENERACIÓN (CASCADA INDEPENDIENTE)
-# ─────────────────────────────────────────────
-def generate_with_nvidia(chat_id: int, prompt_text: str) -> str | None:
-    if not nvidia_client:
-        return None
-    try:
-        logger.info("Solicitando respuesta a NVIDIA...")
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + get_history(chat_id) + [{"role": "user", "content": prompt_text}]
-        response = nvidia_client.chat.completions.create(
-            model=NVIDIA_MODEL,
-            messages=messages,
-            temperature=0.6,
-            max_tokens=1024
-        )
-        if response and response.choices:
-            return response.choices[0].message.content.strip()
-    except Exception as e:
-        logger.warning(f"Error en motor NVIDIA: {e}")
-    return None
-
-def generate_with_grok(chat_id: int, prompt_text: str) -> str | None:
-    if not grok_client:
-        return None
-    try:
-        logger.info("Solicitando respuesta a Grok...")
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + get_history(chat_id) + [{"role": "user", "content": prompt_text}]
-        response = grok_client.chat.completions.create(
-            model=GROK_MODEL,
-            messages=messages,
-            temperature=0.6,
-            max_tokens=1024
-        )
-        if response and response.choices:
-            return response.choices[0].message.content.strip()
-    except Exception as e:
-        logger.warning(f"Error en motor Grok: {e}")
-    return None
-
-def generate_with_claude(chat_id: int, prompt_text: str) -> str | None:
-    if not anthropic_client:
-        return None
-    try:
-        logger.info("Solicitando respuesta a Claude...")
-        messages = get_history(chat_id) + [{"role": "user", "content": prompt_text}]
-        response = anthropic_client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=messages
-        )
-        text_blocks = [block.text for block in response.content if block.type == "text"]
-        result = "\n".join(text_blocks).strip()
-        if result:
-            return result
-    except Exception as e:
-        logger.warning(f"Error en motor Claude: {e}")
-    return None
-
-def generate_with_gemini(prompt_text: str) -> str | None:
-    if not GEMINI_API_KEY:
-        return None
-    for model_name in GEMINI_MODELS_TO_TRY:
-        try:
-            logger.info(f"Solicitando respuesta a Gemini ({model_name})...")
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt_text)
-            if response and response.text:
-                return response.text.strip()
-        except Exception as e:
-            logger.warning(f"Error en modelo Gemini {model_name}: {e}")
-            continue
-    return None
+    if len(history) > 20:
+        conversation_history[chat_id] = history[-20:]
 
 def generate_ai_response(chat_id: int, prompt_text: str) -> str:
-    """Orquestador: NVIDIA -> Grok -> Claude -> Gemini."""
-    res = generate_with_nvidia(chat_id, prompt_text)
-    if res: return res
+    # 1. NVIDIA
+    if nvidia_client:
+        try:
+            msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + get_history(chat_id) + [{"role": "user", "content": prompt_text}]
+            res = nvidia_client.chat.completions.create(model=NVIDIA_MODEL, messages=msgs, temperature=0.6, max_tokens=1024)
+            return res.choices[0].message.content.strip()
+        except Exception as e:
+            logger.warning(f"Error NVIDIA: {e}")
 
-    res = generate_with_grok(chat_id, prompt_text)
-    if res: return res
+    # 2. GROK
+    if grok_client:
+        try:
+            msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + get_history(chat_id) + [{"role": "user", "content": prompt_text}]
+            res = grok_client.chat.completions.create(model=GROK_MODEL, messages=msgs, temperature=0.6, max_tokens=1024)
+            return res.choices[0].message.content.strip()
+        except Exception as e:
+            logger.warning(f"Error Grok: {e}")
 
-    res = generate_with_claude(chat_id, prompt_text)
-    if res: return res
+    # 3. CLAUDE
+    if anthropic_client:
+        try:
+            msgs = get_history(chat_id) + [{"role": "user", "content": prompt_text}]
+            res = anthropic_client.messages.create(model=CLAUDE_MODEL, max_tokens=1024, system=SYSTEM_PROMPT, messages=msgs)
+            return "\n".join([b.text for b in res.content if b.type == "text"]).strip()
+        except Exception as e:
+            logger.warning(f"Error Claude: {e}")
 
-    res = generate_with_gemini(prompt_text)
-    if res: return res
+    # 4. GEMINI
+    if GEMINI_API_KEY:
+        for m in GEMINI_MODELS_TO_TRY:
+            try:
+                res = genai.GenerativeModel(m).generate_content(prompt_text)
+                if res and res.text: return res.text.strip()
+            except Exception:
+                continue
 
-    return "⚠️ Error crítico: Ninguno de los proveedores de IA (NVIDIA, Grok, Claude, Gemini) respondió. Revisa los tokens en Render."
+    return "⚠️ Error crítico: Ninguna API de IA respondió."
 
 # ─────────────────────────────────────────────
-# 7. HANDLERS DE TELEGRAM
+# 6. HANDLERS TELEGRAM
 # ─────────────────────────────────────────────
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = "👋 Benjamin Jarvis online. Sistema de redundancia de 4 niveles activo para AGG y Vórtice IVFA."
-    await update.message.reply_text(welcome_text)
+    await update.message.reply_text("👋 Benjamin Jarvis online. Sistema desinhibido y listo.")
 
 async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_chat or not update.message or not update.message.text:
-        return
-
+    if not update.effective_chat or not update.message or not update.message.text: return
     chat_id = update.effective_chat.id
     user_text = update.message.text
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    sent_message = await update.message.reply_text("🔄 Procesando solicitud...")
+    sent = await update.message.reply_text("🔄 Procesando...")
 
-    ai_response = generate_ai_response(chat_id, user_text)
+    ai_res = generate_ai_response(chat_id, user_text)
 
-    if not ai_response.startswith("⚠️"):
+    if not ai_res.startswith("⚠️"):
         append_history(chat_id, "user", user_text)
-        append_history(chat_id, "assistant", ai_response)
+        append_history(chat_id, "assistant", ai_res)
 
-    await context.bot.edit_message_text(
-        chat_id=chat_id,
-        message_id=sent_message.message_id,
-        text=ai_response
-    )
+    await context.bot.edit_message_text(chat_id=chat_id, message_id=sent.message_id, text=ai_res)
 
 # ─────────────────────────────────────────────
-# 8. PUNTO DE ENTRADA PRINCIPAL
+# 7. EJECUCIÓN
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
-        logger.error("No se encontró el token de Telegram en las variables de entorno.")
-        raise RuntimeError("No se detectó el TELEGRAM_BOT_TOKEN en Render.")
+        raise RuntimeError("No se detectó TELEGRAM_BOT_TOKEN en Render.")
 
-    # Inicia el servidor de salud HTTP en un hilo independiente
-    health_thread = threading.Thread(target=start_health_server, daemon=True)
-    health_thread.start()
+    # Auto-limpieza de conexiones viejas
+    auto_clean_webhook(TELEGRAM_TOKEN)
 
-    # Construye la aplicación de Telegram
+    # Inicia puerto web para Render
+    threading.Thread(target=start_health_server, daemon=True).start()
+
+    # Arranca Telegram
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_user_message))
 
-    logger.info("Bot Benjamin Jarvis iniciado correctamente. Escuchando mensajes...")
+    logger.info("Bot Benjamin Jarvis en ejecución...")
     app.run_polling()

@@ -2,6 +2,7 @@ python-telegram-bot
 openai
 anthropic
 google-generativeai
+requests
 
 
 

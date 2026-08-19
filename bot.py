@@ -1,5 +1,4 @@
 import os
-import time
 import asyncio
 import logging
 import threading
@@ -73,18 +72,14 @@ CLAUDE_MODEL = "claude-sonnet-5"
 GEMINI_MODELS_TO_TRY = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
 # ─────────────────────────────────────────────
-# APIS DE APOYO: VOZ (ElevenLabs) E IMÁGENES (Replicate)
+# APIS DE APOYO: VOZ (ElevenLabs) E IMÁGENES (Pollinations.ai)
 # ─────────────────────────────────────────────
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # voz default multilingüe
 ELEVENLABS_URL = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
 
-REPLICATE_API_KEY = os.environ.get("REPLICATE_API_KEY")
-REPLICATE_MODEL_VERSION = os.environ.get(
-    "REPLICATE_MODEL_VERSION",
-    "black-forest-labs/flux-schnell",  # rápido y gratis dentro del free tier de Replicate
-)
-REPLICATE_URL = f"https://api.replicate.com/v1/models/{REPLICATE_MODEL_VERSION}/predictions"
+# Pollinations.ai — generación de imágenes gratis, sin API key ni tarjeta de crédito
+POLLINATIONS_URL = "https://image.pollinations.ai/prompt"
 
 SYSTEM_PROMPT = (
     "Eres Benjamin Jarvis, orquestador principal de IA y director de operaciones digitales "
@@ -259,58 +254,29 @@ def generate_voice(text: str) -> bytes | None:
 
 
 # ─────────────────────────────────────────────
-# IMÁGENES (Replicate) — texto a imagen (con polling explícito)
+# IMÁGENES (Pollinations.ai) — texto a imagen, gratis y sin API key
 # ─────────────────────────────────────────────
-REPLICATE_POLL_INTERVAL = 2       # segundos entre cada consulta de estado
-REPLICATE_MAX_WAIT_SECONDS = 90    # tiempo máximo total antes de rendirse
+from urllib.parse import quote
 
 
 def generate_image(prompt: str) -> str | None:
-    if not REPLICATE_API_KEY:
-        logger.warning("REPLICATE_API_KEY no configurada, no se puede generar imagen.")
-        return None
     try:
-        headers = {
-            "Authorization": f"Bearer {REPLICATE_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        payload = {"input": {"prompt": prompt}}
+        encoded_prompt = quote(prompt)
+        # nologo=true quita la marca de agua, width/height fijan un tamaño estándar
+        url = f"{POLLINATIONS_URL}/{encoded_prompt}?width=1024&height=1024&nologo=true"
 
-        # 1) Crear la predicción (no esperamos, solo la disparamos)
-        resp = requests.post(REPLICATE_URL, headers=headers, json=payload, timeout=20)
+        logger.info("Generando imagen con Pollinations.ai...")
+        resp = requests.get(url, timeout=60)
         resp.raise_for_status()
-        prediction = resp.json()
-        prediction_url = prediction.get("urls", {}).get("get")
-        status = prediction.get("status")
 
-        if not prediction_url:
-            logger.warning("Replicate no devolvió URL de seguimiento: %s", prediction)
-            return None
-
-        # 2) Consultar el estado en intervalos hasta que termine o se acabe el tiempo
-        elapsed = 0
-        while status not in ("succeeded", "failed", "canceled") and elapsed < REPLICATE_MAX_WAIT_SECONDS:
-            time.sleep(REPLICATE_POLL_INTERVAL)
-            elapsed += REPLICATE_POLL_INTERVAL
-            poll_resp = requests.get(prediction_url, headers=headers, timeout=20)
-            poll_resp.raise_for_status()
-            prediction = poll_resp.json()
-            status = prediction.get("status")
-            logger.info("Replicate estado: %s (%ss transcurridos)", status, elapsed)
-
-        if status != "succeeded":
-            logger.warning("Replicate no terminó a tiempo o falló. Estado final: %s", status)
-            return None
-
-        output = prediction.get("output")
-        if isinstance(output, list) and output:
-            return output[0]
-        if isinstance(output, str):
-            return output
+        # Pollinations devuelve la imagen directamente en el body si todo salió bien
+        if resp.headers.get("Content-Type", "").startswith("image/"):
+            return url  # Telegram puede descargar esta misma URL directamente
+        logger.warning("Pollinations no devolvió una imagen válida. Content-Type: %s", resp.headers.get("Content-Type"))
         return None
 
     except Exception as e:
-        logger.warning("Fallo generando imagen con Replicate: %s", str(e))
+        logger.warning("Fallo generando imagen con Pollinations: %s", str(e))
         return None
 
 
@@ -399,17 +365,14 @@ async def cmd_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
-    sent_message = await update.message.reply_text("🎨 Generando imagen... (puede tardar hasta 90 seg)")
+    sent_message = await update.message.reply_text("🎨 Generando imagen...")
     image_url = await asyncio.to_thread(generate_image, prompt)
 
     if not image_url:
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=sent_message.message_id,
-            text=(
-                "⚠️ No pude generar la imagen a tiempo. Puede ser REPLICATE_API_KEY mal configurada, "
-                "cuota agotada, o el modelo tardó más de 90 seg. Intenta de nuevo."
-            ),
+            text="⚠️ No pude generar la imagen. Pollinations.ai puede estar caído momentáneamente. Intenta de nuevo en un rato.",
         )
         return
 

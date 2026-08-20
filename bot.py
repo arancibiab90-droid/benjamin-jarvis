@@ -1,4 +1,6 @@
 import os
+import io
+import time
 import asyncio
 import logging
 import threading
@@ -78,8 +80,20 @@ ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # voz default multilingüe
 ELEVENLABS_URL = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
 
-# Pollinations.ai — generación de imágenes gratis, sin API key ni tarjeta de crédito
+# Pollinations.ai — generación de imágenes gratis, sin API key ni tarjeta de crédito (respaldo)
 POLLINATIONS_URL = "https://image.pollinations.ai/prompt"
+
+# Hugging Face Inference API — Qwen-Image (Alibaba), gratis con token, mejor calidad/nitidez
+# Acepta cualquiera de estos 3 nombres de variable, por si Render la tiene con otro nombre
+HF_API_KEY = (
+    os.environ.get("HUGGINGFACE_API_KEY")
+    or os.environ.get("HF_TOKEN")
+    or os.environ.get("HUGGINGFACE_TOKEN")
+)
+HF_IMAGE_MODEL = os.environ.get("HF_IMAGE_MODEL", "Qwen/Qwen-Image")
+HF_IMAGE_URL = f"https://api-inference.huggingface.co/models/{HF_IMAGE_MODEL}"
+HF_MAX_WAIT_SECONDS = 40   # tiempo máximo esperando a que el modelo "despierte" en el free tier
+HF_POLL_INTERVAL = 5
 
 SYSTEM_PROMPT = (
     "Eres Benjamin Jarvis, orquestador principal de IA y director de operaciones digitales "
@@ -88,6 +102,19 @@ SYSTEM_PROMPT = (
     "ABASTO EXPRESS/HOLDING AGG (caja rápida, prospección B2B) y TRABAJO EN ALTURA "
     "(seguridad técnica, arneses, protocolos de infraestructura). "
     "Tono: ejecutivo, conciso, directo a la solución, sin rodeos ni relleno."
+)
+
+# Plantilla usada por /contenido — genera 3 formatos listos para publicar en una sola pasada
+CONTENT_PROMPT_TEMPLATE = (
+    "Genera contenido de redes sociales para AGG Global Group / Vórtice IVFA sobre este tema: "
+    '"{tema}"\n\n'
+    "Entrega EXACTAMENTE estos 3 bloques, listos para copiar y pegar:\n\n"
+    "1) GUION REEL/TIKTOK (30-45 seg, con gancho en la primera línea, lenguaje hablado, "
+    "indicaciones de corte de cámara entre corchetes)\n\n"
+    "2) POST LINKEDIN (tono profesional/inversionista, 150-200 palabras, con 3 hashtags al final)\n\n"
+    "3) CAPTION INSTAGRAM/WHATSAPP (corto, con emojis, para difusión masiva/movimiento popular, "
+    "con llamado a la acción claro)\n\n"
+    "No agregues explicaciones extra, solo los 3 bloques con sus títulos."
 )
 
 # ─────────────────────────────────────────────
@@ -254,30 +281,66 @@ def generate_voice(text: str) -> bytes | None:
 
 
 # ─────────────────────────────────────────────
-# IMÁGENES (Pollinations.ai) — texto a imagen, gratis y sin API key
+# IMÁGENES — cascada: Qwen-Image (Hugging Face, alta calidad) → Pollinations (respaldo)
 # ─────────────────────────────────────────────
 from urllib.parse import quote
 
 
-def generate_image(prompt: str) -> str | None:
-    try:
-        encoded_prompt = quote(prompt)
-        # nologo=true quita la marca de agua, width/height fijan un tamaño estándar
-        url = f"{POLLINATIONS_URL}/{encoded_prompt}?width=1024&height=1024&nologo=true"
+def generate_image_hf(prompt: str) -> bytes | None:
+    """Genera imagen con Qwen-Image vía Hugging Face. Devuelve bytes de la imagen o None."""
+    if not HF_API_KEY:
+        return None
+    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+    elapsed = 0
+    while elapsed <= HF_MAX_WAIT_SECONDS:
+        try:
+            resp = requests.post(HF_IMAGE_URL, headers=headers, json={"inputs": prompt}, timeout=45)
+        except Exception as e:
+            logger.warning("Fallo de red con Hugging Face: %s", str(e))
+            return None
 
-        logger.info("Generando imagen con Pollinations.ai...")
-        resp = requests.get(url, timeout=60)
-        resp.raise_for_status()
+        if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image/"):
+            return resp.content
 
-        # Pollinations devuelve la imagen directamente en el body si todo salió bien
-        if resp.headers.get("Content-Type", "").startswith("image/"):
-            return url  # Telegram puede descargar esta misma URL directamente
-        logger.warning("Pollinations no devolvió una imagen válida. Content-Type: %s", resp.headers.get("Content-Type"))
+        if resp.status_code == 503:
+            # El modelo gratuito estaba "dormido" y se está cargando en el servidor — reintentamos
+            logger.info("Qwen-Image cargando en Hugging Face, reintentando en %ss...", HF_POLL_INTERVAL)
+            time.sleep(HF_POLL_INTERVAL)
+            elapsed += HF_POLL_INTERVAL
+            continue
+
+        logger.warning("Hugging Face devolvió estado %s: %s", resp.status_code, resp.text[:200])
         return None
 
+    logger.warning("Hugging Face no respondió a tiempo (modelo tardó demasiado en cargar).")
+    return None
+
+
+def generate_image_pollinations(prompt: str) -> bytes | None:
+    """Genera imagen con Pollinations.ai (gratis, sin key). Devuelve bytes de la imagen o None."""
+    try:
+        encoded_prompt = quote(prompt)
+        url = f"{POLLINATIONS_URL}/{encoded_prompt}?width=1024&height=1024&nologo=true"
+        resp = requests.get(url, timeout=60)
+        resp.raise_for_status()
+        if resp.headers.get("Content-Type", "").startswith("image/"):
+            return resp.content
+        logger.warning("Pollinations no devolvió una imagen válida.")
+        return None
     except Exception as e:
         logger.warning("Fallo generando imagen con Pollinations: %s", str(e))
         return None
+
+
+def generate_image(prompt: str) -> bytes | None:
+    """Cascada: primero Qwen-Image (mejor calidad, requiere HF_API_KEY), luego Pollinations."""
+    image_bytes = generate_image_hf(prompt)
+    if image_bytes:
+        logger.info("Imagen generada con Qwen-Image (Hugging Face).")
+        return image_bytes
+
+    logger.info("Hugging Face no disponible, usando Pollinations como respaldo.")
+    return generate_image_pollinations(prompt)
 
 
 # ─────────────────────────────────────────────
@@ -290,7 +353,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/voz — te leo la última respuesta\n"
         "/vozon — activo audio automático en cada respuesta\n"
         "/vozoff — vuelvo a solo texto\n"
-        "/imagen <descripción> — genero una imagen"
+        "/imagen <descripción> — genero una imagen\n"
+        "/contenido <tema> — guion + post LinkedIn + caption listos para publicar"
     )
 
 
@@ -365,19 +429,46 @@ async def cmd_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
-    sent_message = await update.message.reply_text("🎨 Generando imagen...")
-    image_url = await asyncio.to_thread(generate_image, prompt)
+    sent_message = await update.message.reply_text("🎨 Generando imagen (calidad alta, puede tardar 20-40 seg)...")
+    image_bytes = await asyncio.to_thread(generate_image, prompt)
 
-    if not image_url:
+    if not image_bytes:
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=sent_message.message_id,
-            text="⚠️ No pude generar la imagen. Pollinations.ai puede estar caído momentáneamente. Intenta de nuevo en un rato.",
+            text="⚠️ No pude generar la imagen. Los dos servicios (Hugging Face y Pollinations) fallaron. Intenta de nuevo en un rato.",
         )
         return
 
     await context.bot.delete_message(chat_id=chat_id, message_id=sent_message.message_id)
-    await context.bot.send_photo(chat_id=chat_id, photo=image_url, caption=f"🖼️ {prompt}")
+    photo_file = io.BytesIO(image_bytes)
+    photo_file.name = "benjamin_jarvis.png"
+    await context.bot.send_photo(chat_id=chat_id, photo=photo_file, caption=f"🖼️ {prompt}")
+
+
+# ─────────────────────────────────────────────
+# CONTENIDO DE REDES — genera guion + post LinkedIn + caption en una sola pasada
+# ─────────────────────────────────────────────
+async def cmd_contenido(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    tema = " ".join(context.args) if context.args else ""
+    if not tema:
+        await update.message.reply_text(
+            "Uso: /contenido <tema>\nEj: /contenido avances de Vórtice esta semana"
+        )
+        return
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    sent_message = await update.message.reply_text("✍️ Generando contenido (guion + LinkedIn + caption)...")
+
+    prompt = CONTENT_PROMPT_TEMPLATE.format(tema=tema)
+    # chat_id se pasa solo para reutilizar la cascada de IA (no se guarda en el historial del chat)
+    resultado = await asyncio.to_thread(generate_ai_response, chat_id, prompt)
+
+    await context.bot.delete_message(chat_id=chat_id, message_id=sent_message.message_id)
+    # Telegram limita cada mensaje a 4096 caracteres — partimos si hace falta
+    for i in range(0, len(resultado), 4000):
+        await update.message.reply_text(resultado[i:i + 4000])
 
 
 # ─────────────────────────────────────────────
@@ -398,6 +489,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("vozon", cmd_vozon))
     app.add_handler(CommandHandler("vozoff", cmd_vozoff))
     app.add_handler(CommandHandler("imagen", cmd_imagen))
+    app.add_handler(CommandHandler("contenido", cmd_contenido))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
     # Arranca el servidor HTTP mínimo en un hilo aparte, en paralelo al polling de Telegram
